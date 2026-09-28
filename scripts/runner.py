@@ -152,12 +152,64 @@ def get_usage() -> dict[str, Any]:
     }
 
 
+def load_dataset_plan(
+    plan_path: Path | None,
+    target_names: set[str],
+    reference_names: set[str],
+) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    if plan_path is None:
+        return None, None
+
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    if not isinstance(plan, dict) or set(plan) - {"captions", "references"}:
+        raise ValueError("Dataset plan must be a JSON object with only 'captions' and optional 'references'.")
+
+    captions = plan.get("captions")
+    if not isinstance(captions, dict):
+        raise ValueError("Dataset plan must include a 'captions' object keyed by target image filename.")
+    unknown_targets = set(captions) - target_names
+    missing_captions = target_names - set(captions)
+    if unknown_targets or missing_captions:
+        problems = []
+        if unknown_targets:
+            problems.append(f"unknown target filenames: {', '.join(sorted(unknown_targets))}")
+        if missing_captions:
+            problems.append(f"missing captions for: {', '.join(sorted(missing_captions))}")
+        raise ValueError("Dataset plan caption coverage error (" + "; ".join(problems) + ").")
+    if any(not isinstance(text, str) or not text.strip() for text in captions.values()):
+        raise ValueError("Every dataset plan caption must be a non-empty string.")
+    normalized_captions = {name: text.strip() for name, text in captions.items()}
+
+    references = plan.get("references")
+    if references is None:
+        return normalized_captions, None
+    if not isinstance(references, dict):
+        raise ValueError("Dataset plan 'references' must be an object keyed by target image filename.")
+    unknown_targets = set(references) - target_names
+    missing_references = target_names - set(references)
+    invalid_references = [
+        reference for reference in references.values()
+        if not isinstance(reference, str) or reference not in reference_names
+    ]
+    if unknown_targets or missing_references or invalid_references:
+        problems = []
+        if unknown_targets:
+            problems.append(f"unknown target filenames: {', '.join(sorted(unknown_targets))}")
+        if missing_references:
+            problems.append(f"missing reference choices for: {', '.join(sorted(missing_references))}")
+        if invalid_references:
+            problems.append(f"unknown reference filenames: {', '.join(sorted(map(str, invalid_references)))}")
+        raise ValueError("Dataset plan reference coverage error (" + "; ".join(problems) + ").")
+    return normalized_captions, references
+
+
 def prepare_dataset(
     input_dir: Path,
     output_dir: Path,
     name: str,
     trigger: str,
     reference_dir: Path | None = None,
+    dataset_plan: Path | None = None,
 ) -> dict[str, Any]:
     name = normalize_name(name)
     input_dir = input_dir.resolve()
@@ -179,6 +231,24 @@ def prepare_dataset(
     elif len(raw_images) < 2:
         raise ValueError("At least two input images are required when --reference-dir is not supplied.")
 
+    captions_by_name, references_by_target = load_dataset_plan(
+        dataset_plan,
+        {image.name for image in raw_images},
+        {image.name for image in reference_images},
+    )
+    if references_by_target is not None:
+        reference_by_name = {image.name: image for image in reference_images}
+        self_pairs = [
+            target.name
+            for target in raw_images
+            if target.resolve() == reference_by_name[references_by_target[target.name]].resolve()
+        ]
+        if self_pairs:
+            raise ValueError(
+                "Dataset plan cannot use a target image as its own reference: "
+                + ", ".join(self_pairs)
+            )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     if any(output_dir.iterdir()):
         raise FileExistsError(f"Prepared dataset output directory must be empty: {output_dir}")
@@ -193,8 +263,12 @@ def prepare_dataset(
         sample_number = idx + 1
         target_name = f"{name}_{sample_number:03d}{img.suffix.lower()}"
         target_img = target_dir / target_name
-        reference = reference_images[(idx + 1) % len(reference_images)]
-        if reference.resolve() == img.resolve() and len(reference_images) > 1:
+        if references_by_target is not None:
+            selected_reference = references_by_target[img.name]
+            reference = next(image for image in reference_images if image.name == selected_reference)
+        else:
+            reference = reference_images[(idx + 1) % len(reference_images)]
+        if references_by_target is None and reference.resolve() == img.resolve() and len(reference_images) > 1:
             reference = reference_images[(idx + 2) % len(reference_images)]
         control_img = controls_dir / f"{target_img.stem}{reference.suffix.lower()}"
         shutil.copy2(img, target_img)
@@ -202,16 +276,37 @@ def prepare_dataset(
 
         caption_file = target_img.with_suffix(".txt")
         existing_caption = img.with_suffix(".txt")
-        if existing_caption.is_file() and existing_caption.stat().st_size > 0:
+        if captions_by_name is not None:
+            caption_text = captions_by_name[img.name]
+        elif existing_caption.is_file() and existing_caption.stat().st_size > 0:
             caption_text = existing_caption.read_text(encoding="utf-8").strip()
-            if caption_text and trigger not in caption_text:
-                caption_text = f"{trigger}, {caption_text}"
         else:
             caption_text = ""
+        if caption_text and trigger not in caption_text:
+            caption_text = f"{trigger}, {caption_text}"
         if not caption_text:
             caption_text = f"A clear portrait photo of {trigger}, image {sample_number}."
         caption_file.write_text(caption_text, encoding="utf-8")
-        prepared.append({"image": str(target_img), "reference": str(control_img), "caption": caption_text})
+        prepared.append({
+            "source_image": img.name,
+            "target": target_img.name,
+            "reference_source": reference.name,
+            "reference": control_img.name,
+            "caption": caption_text,
+        })
+
+    dataset_manifest = {
+        "format": "minimax_h3_ref2va_dataset_v1",
+        "name": name,
+        "trigger": trigger,
+        "count": len(prepared),
+        "samples": prepared,
+    }
+    manifest_path = output_dir / "dataset_manifest.json"
+    manifest_path.write_text(
+        json.dumps(dataset_manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     return {
         "ok": True,
@@ -221,6 +316,8 @@ def prepare_dataset(
         "prepared_dir": str(output_dir),
         "targets_dir": str(target_dir),
         "references_dir": str(controls_dir),
+        "manifest": str(manifest_path),
+        "samples": prepared,
     }
 
 
@@ -527,6 +624,7 @@ def main() -> None:
     prep_parser = subparsers.add_parser("prepare", help="Prepare dataset images and captions")
     prep_parser.add_argument("--input-dir", required=True, type=Path, help="Input directory with photos")
     prep_parser.add_argument("--reference-dir", type=Path, default=None, help="Optional directory of same-character reference photos")
+    prep_parser.add_argument("--dataset-plan", type=Path, default=None, help="Optional JSON with agent-authored captions and explicit target/reference pairs")
     prep_parser.add_argument("--output-dir", required=True, type=Path, help="Output directory for training dataset")
     prep_parser.add_argument("--name", default="character", help="Character identifier name")
     prep_parser.add_argument("--trigger", default="", help="Trigger token in prompts (default: <name> person)")
@@ -566,7 +664,14 @@ def main() -> None:
         print(json.dumps(res, indent=2))
 
     elif args.subcommand == "prepare":
-        res = prepare_dataset(args.input_dir, args.output_dir, args.name, args.trigger, args.reference_dir)
+        res = prepare_dataset(
+            args.input_dir,
+            args.output_dir,
+            args.name,
+            args.trigger,
+            args.reference_dir,
+            args.dataset_plan,
+        )
         print(json.dumps(res, indent=2))
 
     elif args.subcommand == "train":
